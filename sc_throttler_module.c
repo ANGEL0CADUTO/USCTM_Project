@@ -24,6 +24,7 @@
 #include <asm/page.h>           // Memory management (pgd_t, etc...) for VTPMO
 #include <linux/jiffies.h>      // Page definitions
 #include <linux/syscalls.h>     // Syscall definitions
+#include <linux/percpu.h>      // Per-CPU variables
 
 
 // Include custom header
@@ -49,28 +50,33 @@ static struct class* sc_driver_class = NULL;    //  Device class structure
 static struct device* sc_driver_device = NULL; // Device structure
 
 // 2. Monitoring State
-static __maybe_unused atomic_t monitor_enabled = ATOMIC_INIT(0); // 0=Disabled, 1=Enabled
-static __maybe_unused unsigned long max_throughput = 0; // Max allowed syscalls per time window
+static atomic_t monitor_enabled = ATOMIC_INIT(0); // 0=Disabled, 1=Enabled
+static unsigned long max_throughput = 0; // Max allowed syscalls per time window
 
 // 3. Rules Storage
-static __maybe_unused DEFINE_HASHTABLE(rules_ht, HT_BITS); //  Hash table for rules
+static DEFINE_HASHTABLE(rules_ht, HT_BITS); //  Hash table for rules
 
 // 4. Concurrency control
-static __maybe_unused DEFINE_MUTEX(conf_mutex);  // Mutex for configuration changes
+static DEFINE_MUTEX(conf_mutex);  // Mutex for configuration changes
 
 // 5. Throttling Logic State
-static __maybe_unused atomic64_t global_counter = ATOMIC64_INIT(0); // Global counter for allowed syscalls
-static __maybe_unused unsigned long window_start_jiffies = 0;      // Start of current time window
-static __maybe_unused spinlock_t window_reset_lock;                // Lock for window reset
-static __maybe_unused DECLARE_WAIT_QUEUE_HEAD(throttle_wq);        // Wait queue for throttled processes
+// Design Choice: We use a global counter and a time window of 1 second (HZ jiffies)
+static atomic64_t global_counter = ATOMIC64_INIT(0); // Global counter for allowed syscalls
+static unsigned long window_start_jiffies = 0;      // Start of current time window
+static spinlock_t window_reset_lock;                // Lock for window reset
+static DECLARE_WAIT_QUEUE_HEAD(throttle_wq);        // Wait queue for throttled processes
 
 // 6. Statistics
-static __maybe_unused DEFINE_PER_CPU(struct sc_cpu_stats, cpu_stats); // Per-CPU stats
-static __maybe_unused struct sc_peak_record peak_record;       // Shared peak record
+static DEFINE_PER_CPU(struct sc_cpu_stats, cpu_stats); // Per-CPU stats
+static struct sc_peak_record peak_record;       // Shared peak record
 static unsigned long module_load_time_jiffies = 0; // For average calculation
 
 // 7. Syscall Hacking Variables
 unsigned long *sys_call_table = NULL; // Pointer to the found table 
+
+// 8. Reentrancy Protection Per-CPU
+// This flag precents the hook from intercepting itself (e.g. printk triggering write)
+DEFINE_PER_CPU(int, sc_in_hook); // 0=Not in hook, 1=In Hook
 
 
 //Array to save original syscalls pointers so we can restore them later
@@ -157,9 +163,22 @@ asmlinkage long sys_hook_wrapper(struct pt_regs *regs){
     s64 delta;
     int identity_match;
     unsigned long name_hash;
+    int *recursion_guard;
 
-    // A. Reentrancy Protection (We do Recursion CHEK BUT WE MUST DO PER CPU LATER, MAYBE WITH FLAGS AND DISABLING INTERRUPTS)
-    if(!atomic_read(&monitor_enabled)) goto execute_original;
+    // A. Reentrancy Protection (Per-CPU Flag)
+    // We disable preemption to safely access per-cpu var, 
+    // although in syscall context we are mostly pinned.
+    // get_cpu_var disables preemption, put_cpu_var enables it.
+    recursion_guard = &get_cpu_var(sc_in_hook);
+    if (*recursion_guard) {
+        put_cpu_var(sc_in_hook);
+        goto execute_original;
+    }
+    *recursion_guard = 1; // Set flag: We are inside the hook
+    put_cpu_var(sc_in_hook);
+
+    // Global Switch Check
+    if (!atomic_read(&monitor_enabled)) goto exit_hook;
 
     //B. RCU Read Lock (Start Critical Section)
     rcu_read_lock();
@@ -174,7 +193,7 @@ asmlinkage long sys_hook_wrapper(struct pt_regs *regs){
     }
 
     //If syscall not monitored skip other checks
-    if(!rule_found) goto unlock_and_execute;
+    if(!rule_found) goto unlock_and_exit;
 
     // 2. Check Identity (UID or Name) - 
     //If we found the syscall is monitored then whe check WHO is calling it
@@ -205,7 +224,7 @@ asmlinkage long sys_hook_wrapper(struct pt_regs *regs){
     }
 
     // If NO identity matched we do NOT throttle
-    if(!identity_match) goto unlock_and_execute;
+    if(!identity_match) goto unlock_and_exit;
 
     // D. Throttling Logic
     should_block = check_throttle();
@@ -217,30 +236,46 @@ asmlinkage long sys_hook_wrapper(struct pt_regs *regs){
         // Update Stats
         this_cpu_inc(cpu_stats.blocked_count);
 
+        // Note: We must clear the recursion flag before sleeping, 
+        // otherwise if we are rescheduled on this CPU, no one can use the hook!
+        // However, wait_event schedules out. The flag is per-CPU, not per-task.
+        // Correct logic: Clear flag -> Sleep -> Set flag on wake (if needed to protect rest).
+        // Since after sleep we just calc stats and exit, we can clear it now.
+        
+        recursion_guard = &get_cpu_var(sc_in_hook);
+        *recursion_guard = 0;
+        put_cpu_var(sc_in_hook);
+
         start = ktime_get();
-
-        // Go to sleep until next window or monitor disabled
         wait_event_interruptible(throttle_wq, 
-            (time_after(jiffies, window_start_jiffies + HZ) || !atomic_read(&monitor_enabled))
+            time_after(jiffies, window_start_jiffies + HZ) || !atomic_read(&monitor_enabled)
         );
-
         end = ktime_get();
 
-        //Update Peak Delay (Global Stat)
+        // Update Peak Delay
         delta = ktime_to_ns(ktime_sub(end, start));
         spin_lock_irqsave(&peak_record.lock, flags);
-        if(delta > peak_record.delay_ns){
+        if (delta > peak_record.delay_ns) {
             peak_record.delay_ns = delta;
             peak_record.uid = current_uid().val;
             memcpy(peak_record.comm, current->comm, 16);
         }
         spin_unlock_irqrestore(&peak_record.lock, flags);
+        
+        goto execute_original; // Flag already cleared
     }
 
+exit_hook:
+    // Reset recursion flag
+    recursion_guard = &get_cpu_var(sc_in_hook);
+    *recursion_guard = 0;
+    put_cpu_var(sc_in_hook);
     goto execute_original;
 
-unlock_and_execute:
-    rcu_read_unlock(); // End Critical Section
+unlock_and_exit:
+    rcu_read_unlock();
+    goto exit_hook;
+
 
 execute_original:
     if (syscall_nr >= 0 && syscall_nr < MAX_SYSCALL_NR && original_sys_call_table[syscall_nr]) {
@@ -294,7 +329,7 @@ static long sc_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             // Insert into Hash Table
             hash_add_rcu(rules_ht, &rule->node, rule->key);
             
-            // If it's a Syscall Rule, we must Hook it in the table!
+            // If it's a Syscall Rule, we must Hook it in the table
             if (conf.type == MON_SYSCALL) {
                 if (conf.value < MAX_SYSCALL_NR && !hacked_status[conf.value]) {
                     unprotect_memory();
@@ -365,6 +400,11 @@ static long sc_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
                 ret = -EFAULT;
             }
             break;
+
+
+        // TODO: IOCTL_LIST_RULES implementation would require a loop over hash table
+        // copying data to user buffer. Omitted for brevity but defined in header.
+
 
         default:
             ret = -EINVAL;
@@ -544,6 +584,10 @@ static int __init sc_throttler_init(void) {
 static void __exit sc_throttler_exit(void)
 {
     int i;
+    struct sc_rule *rule;
+    struct hlist_node *tmp;
+    int bkt;
+
     // 1. Restore Syscall Table (Undo Hacking)
     if (sys_call_table) {
         unprotect_memory();
@@ -562,10 +606,16 @@ static void __exit sc_throttler_exit(void)
     unregister_chrdev(major_number, DEVICE_NAME);
 
     // 3. Free Memory (Hash Table)
-    // Note: A proper cleanup would iterate RCU list and kfree. 
-    // OS will reclaim module pages anyway, but manual cleanup is polite.
-    printk(KERN_INFO "SC_THROTTLER: Unloaded.\n");
+    // We iterate over all buckets and free remaining nodes.
+    // Since we are unloading, we don't need RCU protection here (no readers left).
+    hash_for_each_safe(rules_ht, bkt, tmp, rule, node) {
+        hash_del(&rule->node);
+        kfree(rule);
+    }
+
+    printk(KERN_INFO "SC_THROTTLER: Unloaded and Memory Freed.\n");
 }
+
 
 module_init(sc_throttler_init);
 module_exit(sc_throttler_exit);
