@@ -95,7 +95,8 @@ static inline void protect_memory(void){
 }
 
 static inline void unprotect_memory(void){
-    write_cr0_forced(cr0);
+    cr0 = read_cr0(); // 1. Leggi il valore attuale del registro CPU
+    write_cr0_forced(cr0 & ~0x00010000); // 2. Disabilita il bit 16 (Write Protect)
 }
 
 
@@ -160,7 +161,7 @@ asmlinkage long sys_hook_wrapper(struct pt_regs *regs){
     // A. Reentrancy Protection (We do Recursion CHEK BUT WE MUST DO PER CPU LATER, MAYBE WITH FLAGS AND DISABLING INTERRUPTS)
     if(!atomic_read(&monitor_enabled)) goto execute_original;
 
-    //B. RCU Read Lock (Start Critical Section
+    //B. RCU Read Lock (Start Critical Section)
     rcu_read_lock();
 
     // C.Check Rules (Hash Table Lookup)
@@ -192,7 +193,7 @@ asmlinkage long sys_hook_wrapper(struct pt_regs *regs){
     }
 
     //Check Name HASH
-    unsigned long name_hash = string_hash(current->comm);
+    name_hash = string_hash(current->comm);
     hash_for_each_possible_rcu(rules_ht,rule, node, name_hash){
         if(rule->type == MON_NAME && rule->key == name_hash){
             // Verify exact string to avoid hash collision
@@ -458,7 +459,7 @@ unsigned long* find_sys_call_table(void){
         // This pattern is consistent across most x86-64 kernels.
         
         //We verify that a block of memory is readable first
-        if (!vtpmo((unsigned long)(chk + 134)) || !vtpmo((unsigned long)&(chk[183]))) continue;
+        if (!vtpmo((unsigned long)&(chk[134])) || !vtpmo((unsigned long)&(chk[183]))) continue;
 
         if (chk[134] == chk[135] && chk[134] == chk[174] && chk[134] == chk[182] && chk[134] == chk[183]){
             printk(KERN_INFO "SC_THROTTLER: sys_call_table found at address: 0x%lx\n", i);
