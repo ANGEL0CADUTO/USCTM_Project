@@ -71,6 +71,7 @@ struct sc_stats{
 #define IOCTL_SET_ONOFF     _IOW(SC_IOC_MAGIC, 4, int)
 #define IOCTL_GET_STATS     _IOR(SC_IOC_MAGIC, 5, struct sc_stats)
 #define IOCTL_LIST_RULES    _IOWR(SC_IOC_MAGIC,6, char*)
+#define IOCTL_SIMULATE_SYSCALL _IOW(SC_IOC_MAGIC, 99, int)
 
 
 
