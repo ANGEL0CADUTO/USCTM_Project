@@ -1,58 +1,42 @@
-/* test_simulatio.c - DEBUG VERSION */
+/* test_workload.c - GENERATORE DI TRAFFICO REALE */
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
 #include <time.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <errno.h>
-#include <string.h>
-
-#define SC_IOC_MAGIC 's'
-#define IOCTL_SIMULATE_SYSCALL _IOW(SC_IOC_MAGIC, 99, int)
 
 int main() {
-    int fd;
     unsigned long count = 0;
     time_t start, now;
-    int target_syscall = 83; 
-    int ret;
-
-    printf("TEST DEBUG: Opening driver...\n");
-    fd = open("/dev/sc_throttler", O_RDWR);
-    if (fd < 0) {
-        perror("FATAL: Cannot open driver");
-        return -1;
-    }
-
-    printf("TEST DEBUG: Driver opened. FD: %d\n", fd);
-    printf("TEST DEBUG: Starting stress test loop...\n");
-
-    start = time(NULL);
     
-    while(1) {
-        // Chiamata al driver
-        ret = ioctl(fd, IOCTL_SIMULATE_SYSCALL, target_syscall);
-        
-        // --- CONTROLLO ERRORE FONDAMENTALE ---
-        if (ret < 0) {
-            // Se fallisce, stampa l'errore e muori. 
-            // Cosi capiamo perche non vedevi log nel kernel.
-            printf("\nFATAL ERROR in Loop: IOCTL failed! Return: %d, Error: %s\n", 
-                   ret, strerror(errno));
-            break;
-        }
-        // -------------------------------------
+    // Scegli qui quale syscall bombardare. 
+    // Usa 39 (getpid) se hai configurato quella, o 83 (mkdir) se hai configurato quella.
+    // Consiglio 39 per testare Ftrace in sicurezza.
+    long target_syscall = 83; 
 
+    printf("TEST: Starting REAL syscall loop (Target: %ld)...\n", target_syscall);
+    printf("TEST: My PID is %d (Register this UID/Name if needed!)\n", getpid());
+    
+    start = time(NULL);
+    while(1) {
+        // QUESTA È LA CHIAVE: Facciamo una VERA syscall.
+        // Ftrace la vedrà passare e la bloccherà se supera il limite.
+        syscall(target_syscall);
+        
         count++;
+
+        // RALLENTAMENTO ARTIFICIALE
+        // Dorme per 10ms -> Genera circa 100 chiamate/sec massime.
+        // Se il throttler è impostato a 5, vedrai il conteggio crollare.
+        usleep(10000); 
+
         now = time(NULL);
         if (now > start) {
-            printf("TEST DEBUG: %lu calls/sec\n", count);
+            printf("TEST: %lu calls/sec\n", count);
             count = 0;
             start = now;
         }
     }
-
-    close(fd);
     return 0;
 }
