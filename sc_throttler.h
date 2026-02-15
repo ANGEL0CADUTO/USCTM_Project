@@ -53,6 +53,7 @@ struct sc_conf{
 struct sc_stats{
     unsigned long long blocked_total;   // Number of throttled/blocked calls
     unsigned long long avg_blocked;     // Average number of blocked threads per second
+    unsigned long long peak_blocked;    // Max blocked threads in a single 1s window
     unsigned long long peak_delay_ns;   // Highest Peak delay observed for the actual execution of an invoked system call (nanoseconds)
     unsigned long peak_uid;             // UID associated with the system call who experienced highest peak delay
     char peak_comm[16];                 // Program Name associated with the system call who experienced the highest peak delay
@@ -71,7 +72,7 @@ struct sc_stats{
 #define IOCTL_SET_ONOFF     _IOW(SC_IOC_MAGIC, 4, int)
 #define IOCTL_GET_STATS     _IOR(SC_IOC_MAGIC, 5, struct sc_stats)
 #define IOCTL_LIST_RULES    _IOWR(SC_IOC_MAGIC,6, char*)
-#define IOCTL_SIMULATE_SYSCALL _IOW(SC_IOC_MAGIC, 99, int)
+
 
 
 
@@ -95,7 +96,6 @@ struct sc_rule {
         int type;               // Type of rule (to distinguish beetween rules in same slot)
         unsigned long key;      // Hash Key (derived from UID, SyscallNr, or Name Hash)
         char name[16];          // Copy of the name (for safety checks when)
-
         struct hlist_node node; // Hook for the Hash Table
         struct rcu_head rcu;    // Hook for RCU (to guarantee garbage collection when doing deferred reclamation)
 };
@@ -111,6 +111,7 @@ struct sc_cpu_stats{
 // Structure shared by all CPUs to register peak stats
 struct sc_peak_record{
     unsigned long long delay_ns;
+    unsigned long long peak_blocked_window;
     unsigned int uid;
     char comm[16];
     spinlock_t lock;                // Lock so that different CPUS cannot write simultaneosly

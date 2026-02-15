@@ -1,4 +1,4 @@
-/* syscall_generator_slow.c - Generates Syscall 39 (getpid) with Delay */
+/* syscall_generator.c - VERSIONE GETPID (39) */
 #include <stdio.h>
 #include <unistd.h>
 #include <time.h>
@@ -9,18 +9,20 @@ int main() {
     unsigned long count = 0;
     time_t start, now;
     
-    printf("TEST: Starting CONTROLLED syscall loop (Force Syscall 83)...\n");
-    printf("TEST: Generating approx 100 calls/sec natively to save VM CPU.\n");
+    printf("TEST: Starting CONTROLLED syscall loop (Target: getpid / 39)...\n");
+    // PID del processo corrente (così verifichi anche che sia quello giusto)
+    printf("TEST: My PID is %d\n", getpid()); 
     
     start = time(NULL);
     while(1) {
-        // FORZIAMO la syscall 83 (mkdir)
-        syscall(83);
+        // FORZIAMO la syscall 39 (getpid)
+        // getpid è molto leggera, quindi il loop sarà velocissimo.
+        syscall(39);
+        
         count++;
 
         // RALLENTAMENTO ARTIFICIALE
-        // Dorme per 10.000 microsecondi (0.01 secondi) -> ~100 chiamate/sec max
-        // Se il throttler funziona e metti MAX=10, dovrai vedere 10, non 100.
+        // 10ms di sleep -> ~100 calls/sec
         usleep(10000); 
 
         now = time(NULL);
