@@ -7,8 +7,8 @@
  * kernel data structures protected by RCU.
  */
 
-#ifndef _SC_THROTTLER_C 
-#define _SC_THROTTLER_C
+#ifndef _SC_THROTTLER_H
+#define _SC_THROTTLER_H
 
 #include <linux/ioctl.h>
 #include <linux/types.h>
