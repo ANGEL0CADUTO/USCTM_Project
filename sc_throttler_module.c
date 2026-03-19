@@ -28,10 +28,12 @@
 #include "sc_throttler.h" 
 
 // Module metadata
+// Developed and tested on Linux kernel 5.15.0-173-generic (x86-64)
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Angelo Romano");
 MODULE_DESCRIPTION("System Call Throttler");
 MODULE_VERSION("1.0");  
+
 
 // Device driver setup
 #define DEVICE_NAME "sc_throttler"
