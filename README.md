@@ -1,4 +1,3 @@
-```markdown
 # SC_THROTTLER
 
 Linux Kernel Module (LKM) implementing a **system call throttling mechanism** for x86-64 Linux systems.
@@ -308,11 +307,6 @@ For a stable presentation:
 * Prefer **program-name filtering** for live demos.
 * Use a dedicated user such as `throttleuser` for EUID-based tests.
 * Avoid broad throttling on your main desktop user.
-* Use `timeout` when launching long-running tests, e.g.:
-  ```bash
-  timeout 5s ./test_identity evil_app
-  timeout 5s su throttleuser -c "./test_uid"
-  ```
 
 ---
 
@@ -321,4 +315,3 @@ Angelo Romano
 
 ## License
 GPL
-```
