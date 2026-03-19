@@ -7,7 +7,7 @@
 int main() {
     unsigned long count = 0;
     time_t start, now;
-    long target_syscall = 1; // mkdir
+    long target_syscall = 83; // mkdir
 
     printf("[*] TEST: Starting SAFE syscall loop (Target: mkdir / 83)...\n");
     printf("[*] TEST: My PID is %d\n", getpid());
