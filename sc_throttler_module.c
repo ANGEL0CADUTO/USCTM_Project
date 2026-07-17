@@ -677,7 +677,6 @@ static void __exit sc_throttler_exit(void) {
     struct sc_rule *rule;
     struct hlist_node *tmp;
     int bkt;
-    struct ftrace_hook *to_free[MAX_SYSCALL_NR] = { NULL };
     
     
     // Disable monitoring and wake up any waiting threads
@@ -691,7 +690,6 @@ static void __exit sc_throttler_exit(void) {
 
         old_hook = rcu_dereference_protected(hooks[i], 1);
         if (old_hook) {
-            to_free[i] = old_hook;
             fh_remove_hook(old_hook);
         }
     }
@@ -702,9 +700,12 @@ static void __exit sc_throttler_exit(void) {
     // Now no new callbacks can enter, and old readers are gone:
     // unpublish hook pointers and free them
     for (i = 0; i < MAX_SYSCALL_NR; i++) {
-        if (to_free[i]) {
+        struct ftrace_hook *old_hook;
+
+        old_hook = rcu_dereference_protected(hooks[i], 1);
+        if (old_hook) {
             RCU_INIT_POINTER(hooks[i], NULL);
-            kfree(to_free[i]);
+            kfree(old_hook);
         }
     }
 

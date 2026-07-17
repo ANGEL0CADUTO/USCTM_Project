@@ -148,17 +148,28 @@ make clean
 
 ## Deployment
 
-To compile, remove any old instance, insert the module, and start the CLI:
+Run the complete presentation demo with one command:
 ```bash
-sudo ./deploy.sh
+./demo.sh
 ```
 
-This script:
-1. Runs `make clean && make`
-2. Removes any old `sc_throttler` instance
-3. Inserts the new module
-4. Prints recent kernel logs
-5. Starts the manual CLI
+The launcher compiles and loads the module, checks the device and kernel
+version, runs all seven tests with a pause between them, checks the kernel log,
+and performs the final cleanup.
+
+To open the general launcher menu:
+```bash
+./deploy.sh
+```
+
+Direct modes are also available:
+```bash
+./deploy.sh prepare    # Build and load only
+./deploy.sh cli        # Build, load and open the CLI
+./deploy.sh tests      # Build, load and open the test menu
+./deploy.sh full       # Complete presentation demo
+./deploy.sh cleanup    # Disable and unload the module
+```
 
 ---
 
