@@ -101,8 +101,7 @@ struct sc_rule {
 };
 
 
-
-// This structure counts the stats Per-CPU, and it's used only if running with Per-CPU counter instead of global
+// Structure to hold per-CPU statistics
 struct sc_cpu_stats{
     unsigned long blocked_count; // Number of blocked thread by this CPU
 };
@@ -110,10 +109,10 @@ struct sc_cpu_stats{
 
 // Structure shared by all CPUs to register peak stats
 struct sc_peak_record{
-    unsigned long long delay_ns;
-    unsigned long long peak_blocked_window;
-    unsigned int uid;
-    char comm[16];
+    unsigned long long delay_ns;    // Highest Peak delay observed for the actual execution of an invoked system call (nanoseconds)
+    unsigned long long peak_blocked_window; // Max blocked threads in a single 1s window
+    unsigned int uid; // UID associated with the system call who experienced highest peak delay
+    char comm[16];    // Program Name associated with the system call who experienced the highest peak delay    
     spinlock_t lock;                // Lock so that different CPUS cannot write simultaneosly
 };
 

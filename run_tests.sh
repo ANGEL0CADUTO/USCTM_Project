@@ -30,7 +30,7 @@ echo -e "${BLUE}           AUTOMATED TEST SUITE                      ${NC}"
 echo -e "${BLUE}=====================================================${NC}"
 
 while true; do
-    echo -e "\n${YELLOW}Select the Test to show to the Professor:${NC}"
+    echo -e "\n${YELLOW}Select the Test :${NC}"
     echo "1) Test 1: Security (Root Permissions & IOCTL)"
     echo "2) Test 2: Program Name Filtering"
     echo "3) Test 3: Effective User-ID (EUID) Filtering"
@@ -45,7 +45,8 @@ while true; do
         1)
             echo -e "\n${GREEN}[TEST 1] SECURITY AND PERMISSIONS (EUID != 0)${NC}"
             su "$REAL_USER" -c "echo -e '4\n1\n0' | ./user_cli"
-            echo -e "${GREEN}[+] Test Passed: IOCTL protected correctly.${NC}"
+            echo -e "${GREEN}[+] Test Passed: non-root device access correctly denied.${NC}"
+            echo "[*] The ioctl handler independently enforces current_euid() == 0."            
             ;;
         2)
             echo -e "\n${GREEN}[TEST 2] PROGRAM NAME FILTERING${NC}"
@@ -125,12 +126,27 @@ while true; do
                 echo -e "${RED}[-] Module removal failed.${NC}"
             fi
 
-            kill "$PID_TEST" 2>/dev/null
+            if wait "$PID_TEST"; then
+                echo -e "${GREEN}[+] Test process resumed and terminated normally.${NC}"
+            else
+                STATUS=$?
+                echo -e "${RED}[-] Test process exited abnormally: status $STATUS.${NC}"
+            fi
+
             insmod sc_throttler.ko
             ;;
         0)
-            echo "Exiting..."
-            reset_env
+            echo "Exiting and cleaning up..."
+
+            cli_cmd "4\n0"
+            rmmod sc_throttler 2>/dev/null || true
+
+            if lsmod | grep -q '^sc_throttler'; then
+                echo -e "${RED}[-] Module is still loaded.${NC}"
+            else
+                echo -e "${GREEN}[+] Module unloaded successfully.${NC}"
+            fi
+
             exit 0
             ;;
         *)

@@ -42,25 +42,24 @@ static struct class* sc_driver_class = NULL;
 static struct device* sc_driver_device = NULL; 
 
 // Global state for throttling
-static atomic_t monitor_enabled = ATOMIC_INIT(0); 
-static unsigned long max_throughput = 0; 
-static atomic64_t global_counter = ATOMIC64_INIT(0); 
-static unsigned long window_start_jiffies = 0;      
-static spinlock_t window_reset_lock;                
-static DECLARE_WAIT_QUEUE_HEAD(throttle_wq);        
+static atomic_t monitor_enabled = ATOMIC_INIT(0);  // 0=Disabled, 1=Enabled
+static unsigned long max_throughput = 0; // Max allowed calls per second
+static atomic64_t global_counter = ATOMIC64_INIT(0); // Counts the number of calls in the current window
+static unsigned long window_start_jiffies = 0; // Start time of the current 1-second window
+static spinlock_t window_reset_lock;    // Lock for resetting the window and updating counters               
+static DECLARE_WAIT_QUEUE_HEAD(throttle_wq); // Wait queue for threads that are throttled and waiting for the next window    
 
 // Data structures for rules and statistics
-static DEFINE_HASHTABLE(rules_ht, HT_BITS); 
-static DEFINE_MUTEX(conf_mutex);  
-static DEFINE_PER_CPU(struct sc_cpu_stats, cpu_stats); 
-static struct sc_peak_record peak_record;       
-static unsigned long module_load_time_jiffies = 0; 
-static unsigned long long last_window_blocked_sum = 0; 
+static DEFINE_HASHTABLE(rules_ht, HT_BITS); // Hash table for monitoring rules (keyed by syscall number, UID, or name hash)
+static DEFINE_MUTEX(conf_mutex);  // Mutex for synchronizing configuration changes (add/remove rules, set max, enable/disable)
+static DEFINE_PER_CPU(struct sc_cpu_stats, cpu_stats); // Per-CPU statistics for blocked calls, they get aggregated only when requested to reduce cache line contention
+static struct sc_peak_record peak_record;       // Shared structure for recording peak delay and blocked threads across all CPUs
+static unsigned long module_load_time_jiffies = 0; // Timestamp when the module was loaded, used for calculating average blocked calls per second
+static unsigned long long last_window_blocked_sum = 0; // Total blocked calls at the end of the last 1-second window, used to calculate delta for peak blocked threads
 
 static atomic_t active_threads = ATOMIC_INIT(0);
 
-// Synchronous anti-recursion guard to prevent ftrace loops
-DEFINE_PER_CPU(int, sc_in_hook); 
+
 
 // Structure to hold ftrace hook information
 struct ftrace_hook {
@@ -109,12 +108,15 @@ static unsigned long *sys_call_table = NULL;
 // Ftrace callback function that redirects syscalls to our wrapper
 static void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
                                     struct ftrace_ops *ops, struct ftrace_regs *fregs) {
+    // Get the current register state and the hook structure
     struct pt_regs *regs = ftrace_get_regs(fregs); 
     struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
     
-    // If the current CPU has the guard raised, ignore the hook to prevent ftrace loops
-    if (this_cpu_read(sc_in_hook)) return;
+    // When the wrapper calls the original syscall, parent_ip belongs to this module. Do not redirect it again, otherwise recursion occurs.
+    if (within_module(parent_ip, THIS_MODULE))
+        return;
 
+    // Redirect the instruction pointer to our wrapper function
     if (regs) {
         regs->ip = (unsigned long)hook->function;
     }
@@ -124,12 +126,15 @@ static void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
 static int fh_install_hook(struct ftrace_hook *hook) {
     int err;
 
+    // sets up function to be called when the hook is triggered
     hook->ops.func = fh_ftrace_thunk;
+    // Set flags to save registers, allow recursion, and modify instruction pointer
     hook->ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY;
-
+    
+    // Set the address of the target function to hook
     err = ftrace_set_filter_ip(&hook->ops, hook->address, 0, 0);
     if (err) return err;
-
+    // Register the ftrace hook with the kernel
     err = register_ftrace_function(&hook->ops);
     if (err) {
         // Roll back the filter if registration fails
@@ -137,6 +142,7 @@ static int fh_install_hook(struct ftrace_hook *hook) {
         return err;
     }
 
+    // Mark the hook as registered so we can clean it up later
     hook->registered = 1;
     return 0;
 }
@@ -152,15 +158,16 @@ static void fh_remove_hook(struct ftrace_hook *hook) {
 
 // Check if the current syscall should be throttled based on throughput limits
 int check_throttle(void){
-    unsigned long now = jiffies;
-    unsigned long flags;
-    u64 val;
-    int cpu;
-    unsigned long long current_total_blocked = 0;
-    unsigned long long window_blocked_delta = 0;
+    unsigned long now = jiffies; // Get the current time in jiffies for window management
+    unsigned long flags; // For saving interrupt flags during spinlock operations
+    u64 val; // The current count of syscalls in the current window, used to determine if we exceed max throughput
+    int cpu; // Loop variable for iterating over online CPUs to aggregate blocked counts
+    unsigned long long current_total_blocked = 0; // Total number of blocked calls across all CPUs in the current window
+    unsigned long long window_blocked_delta = 0; // The number of blocked calls in the current 1-second window, used to update peak statistics
 
     // Reset the window every second (HZ jiffies)
     if(time_after(now, READ_ONCE(window_start_jiffies) + HZ)){
+        // Acquire lock to safely reset the window and update counters
         spin_lock_irqsave(&window_reset_lock, flags);
         if(time_after(now, window_start_jiffies + HZ)){
             // Calculate total blocked calls across all CPUs
@@ -183,30 +190,33 @@ int check_throttle(void){
 
     // Increment global counter and check against max throughput
     val = atomic64_inc_return(&global_counter);
+
+    // MAX+1 gets blocked
     if(val > max_throughput) return 1;
     return 0;
 }
 
 // Main syscall hook wrapper that intercepts and potentially throttles syscalls
 asmlinkage long sys_hook_wrapper(struct pt_regs *regs) {
-    unsigned long syscall_nr = regs->orig_ax; 
-    int should_block = 0;
-    unsigned long flags;
-    ktime_t start_time, end_time;
-    s64 delta;
-    int is_syscall_monitored;
-    int entity_match;
-    unsigned long name_hash;
-    struct sc_rule *rule;
-    long ret;
-    long timeout_jiffies;
-    long wait_ret;
-    struct ftrace_hook *hook;
-    sys_call_ptr_t orig_func;
+    unsigned long syscall_nr = regs->orig_ax;  // Get the syscall number from the register, origin_ax is the original syscall number of the process that entered the kernel
+    int should_block = 0; // Flag to determine if the current syscall should be throttled
+    unsigned long flags; // For saving interrupt flags during spinlock operations
+    ktime_t start_time, end_time; // For measuring the delay caused by throttling
+    s64 delta; // The time difference in nanoseconds between when the syscall was invoked and when it was allowed to proceed
+    int is_syscall_monitored; // Flag to check if the current syscall is registered for monitoring
+    int entity_match; // Flag to check if the current user or process matches any registered monitoring rule
+    unsigned long name_hash; // Hash of the current process name for name-based monitoring
+    struct sc_rule *rule; // Pointer to iterate through the monitoring rules in the hash table
+    long ret; // Return value of the original syscall or error codes for throttling decisions
+    long timeout_jiffies; // The number of jiffies to wait before the next window starts, used for throttling
+    long wait_ret; // Return value from wait_event_interruptible_timeout, used to determine if the wait was interrupted or timed out
+    struct ftrace_hook *hook; // Pointer to the ftrace hook structure associated with the current syscall, used to access the original function pointer and other hook metadata
+    sys_call_ptr_t orig_func; // Pointer to the original syscall function, used to call the original syscall after throttling checks and potential delays
 
     // Validate syscall number
     if (unlikely(syscall_nr >= MAX_SYSCALL_NR)) return -ENOSYS; 
 
+    // Increment the count of active threads in the throttler to track how many threads are currently being processed
     atomic_inc(&active_threads);
 
 retry_throttling:
@@ -295,6 +305,7 @@ retry_throttling:
         timeout_jiffies = (long)(READ_ONCE(window_start_jiffies) + HZ - jiffies);
         if (timeout_jiffies < 1) timeout_jiffies = 1;
 
+        // Wait for either the next window or until monitoring is disabled, with a timeout
         wait_ret = wait_event_interruptible_timeout(throttle_wq, 
              !atomic_read(&monitor_enabled), 
              timeout_jiffies
@@ -318,15 +329,10 @@ retry_throttling:
         goto retry_throttling;
     }
 
-execute_original:
+
     // Execute the original syscall with anti-recursion guard
-    preempt_disable();
-    this_cpu_write(sc_in_hook, 1);
-
+execute_original:
     ret = orig_func(regs);
-
-    this_cpu_write(sc_in_hook, 0);
-    preempt_enable();
 
     atomic_dec(&active_threads);
     return ret;
@@ -395,61 +401,73 @@ static long sc_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 
             // If it's a syscall rule, install the hook BEFORE publishing the rule
             if (conf.type == MON_SYSCALL) {
+                // reads the hook pointer safely under RCU to check if it's already installed
                 if (rcu_access_pointer(hooks[conf.value])) {
                     ret = -EEXIST;
                     break;
                 }
-
+                // Validate that the syscall number is valid and the address is non-null
                 if (!sys_call_table) {
                     ret = -EINVAL;
                     break;
                 }
-
+                // gets real address of the syscall from the syscall table
                 target_addr = sys_call_table[conf.value];
                 if (!target_addr) {
                     ret = -EINVAL;
                     break;
                 }
 
+                // Allocate and initialize the ftrace_hook structure
                 h = kmalloc(sizeof(struct ftrace_hook), GFP_KERNEL);
                 if (!h) {
                     ret = -ENOMEM;
                     break;
                 }
 
+
                 memset(h, 0, sizeof(struct ftrace_hook));
+                // Set up the hook structure with the target syscall information
                 h->address = target_addr;
                 h->function = sys_hook_wrapper; 
                 h->original = (void*)target_addr; 
                 h->syscall_nr = conf.value;
                 h->registered = 0;
 
+                // Install the ftrace hook for the specified syscall
                 ret = fh_install_hook(h);
                 if (ret) {
                     kfree(h);
                     break;
                 }
 
+                // Safely publish the hook pointer under RCU so that other CPUs can see it
                 rcu_assign_pointer(hooks[conf.value], h);
                 printk(KERN_INFO "SC_THROTTLER: Hook installed on Syscall %lu\n", conf.value);
             }
 
+            // Allocate and initialize the rule structure
             rule = kmalloc(sizeof(struct sc_rule), GFP_KERNEL);
             if (!rule) {
                 // Roll back hook installation if rule allocation fails after syscall hook install
                 if (conf.type == MON_SYSCALL) {
+                    // Safely remove the hook and free memory under RCU
                     h = rcu_dereference_protected(hooks[conf.value], lockdep_is_held(&conf_mutex));
                     if (h) {
+                        // First disconnect ftrace so no new callbacks can enter the wrapper
                         RCU_INIT_POINTER(hooks[conf.value], NULL);
+                        // Wait until all pre-existing RCU readers have left the wrapper
                         fh_remove_hook(h);
+                        // Now it is safe to unpublish and free the hook
                         synchronize_rcu();
+                        // Free the hook memory
                         kfree(h);
                     }
                 }
                 ret = -ENOMEM;
                 break;
             }
-
+            // Initialize the rule structure with the provided configuration
             rule->type = conf.type;
             rule->key = key;
             if (conf.type == MON_NAME) {
@@ -457,7 +475,7 @@ static long sc_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             } else {
                 rule->name[0] = '\0';
             }
-
+            // Add the new rule to the hash table under RCU protection
             hash_add_rcu(rules_ht, &rule->node, rule->key);
             break;
         }
@@ -660,6 +678,7 @@ static void __exit sc_throttler_exit(void) {
     struct hlist_node *tmp;
     int bkt;
     struct ftrace_hook *to_free[MAX_SYSCALL_NR] = { NULL };
+    
     
     // Disable monitoring and wake up any waiting threads
     atomic_set(&monitor_enabled, 0);
