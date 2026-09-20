@@ -16,6 +16,8 @@ FULL_MODE=0
 NO_PAUSE=0
 FAILURE_COUNT=0
 CLEANED_UP=0
+# Restore the device mode even if the security test is interrupted.
+DEVICE_MODE_TO_RESTORE=""
 
 case "${1:-}" in
     --full) FULL_MODE=1 ;;
@@ -93,6 +95,11 @@ reset_env() {
 cleanup_env() {
     [[ "$CLEANED_UP" -eq 1 ]] && return 0
 
+    if [[ -n "$DEVICE_MODE_TO_RESTORE" && -e /dev/sc_throttler ]]; then
+        chmod "$DEVICE_MODE_TO_RESTORE" /dev/sc_throttler || true
+        DEVICE_MODE_TO_RESTORE=""
+    fi
+
     if [[ -e /dev/sc_throttler ]]; then
         cli_cmd '4\n0' || true
     fi
@@ -121,6 +128,12 @@ pause_demo() {
 }
 
 configure_name_test() {
+    echo "[*] Reset: monitor OFF -> rmmod sc_throttler -> insmod ./sc_throttler.ko"
+    echo "[*] CLI inputs (configured as root):"
+    echo "    3 -> 5           Set MAX = 5"
+    echo "    1 -> 1 -> 39     Add syscall getpid (39)"
+    echo "    1 -> 3 -> evil_app  Add program name evil_app"
+    echo "    4 -> 1           Enable monitor"
     reset_env &&
         cli_cmd '3\n5' &&
         cli_cmd '1\n1\n39' &&
@@ -129,6 +142,12 @@ configure_name_test() {
 }
 
 configure_uid_test() {
+    echo "[*] Reset: monitor OFF -> rmmod sc_throttler -> insmod ./sc_throttler.ko"
+    echo "[*] CLI inputs (configured as root):"
+    echo "    3 -> 5           Set MAX = 5"
+    echo "    1 -> 1 -> 83     Add syscall mkdir (83)"
+    echo "    1 -> 2 -> $REAL_UID  Add EUID of $REAL_USER"
+    echo "    4 -> 1           Enable monitor"
     reset_env &&
         cli_cmd '3\n5' &&
         cli_cmd '1\n1\n83' &&
@@ -137,6 +156,12 @@ configure_uid_test() {
 }
 
 configure_concurrency_test() {
+    echo "[*] Reset: monitor OFF -> rmmod sc_throttler -> insmod ./sc_throttler.ko"
+    echo "[*] CLI inputs (configured as root):"
+    echo "    3 -> 5           Set MAX = 5"
+    echo "    1 -> 1 -> 39     Add syscall getpid (39)"
+    echo "    1 -> 3 -> test_barrier  Add program name test_barrier"
+    echo "    4 -> 1           Enable monitor"
     reset_env &&
         cli_cmd '3\n5' &&
         cli_cmd '1\n1\n39' &&
@@ -149,6 +174,7 @@ run_and_expect() {
     shift
     local output status
 
+    echo "[*] Command: $*"
     output="$("$@" 2>&1)"
     status=$?
     printf '%s\n' "$output"
@@ -156,25 +182,66 @@ run_and_expect() {
 }
 
 run_test_1() {
-    local output
-    echo -e "\n${GREEN}[TEST 1] SECURITY AND PERMISSIONS (EUID != 0)${NC}"
-    ensure_module_loaded || return 1
+    local output status original_mode
+    echo -e "\n${GREEN}[TEST 1] SECURITY: DEVICE PERMISSIONS + ROOT-ONLY IOCTL${NC}"
+    reset_env || return 1
 
-    output="$(su -s /bin/bash "$REAL_USER" -c "printf '4\\n1\\n0\\n' | ./user_cli" 2>&1)"
+    echo "[*] Layer 1: non-root attempts open() with the original device permissions."
+    echo "[*] Executing user_cli as $REAL_USER (EUID $REAL_UID), input: 0 -> Exit"
+    echo "[*] Expect open() to fail with EACCES / Permission denied."
+    ls -l /dev/sc_throttler
+    output="$(su -s /bin/bash "$REAL_USER" -c "printf '0\\n' | ./user_cli" 2>&1)"
+    status=$?
     printf '%s\n' "$output"
-    if grep -qiE 'Permission denied|Operation not permitted|Failed to open device|Failed to set status' <<<"$output"; then
-        echo -e "${GREEN}[+] Non-root configuration correctly denied.${NC}"
-        return 0
+    if [[ "$status" -eq 0 ]] || ! grep -qF 'Permission denied' <<<"$output"; then
+        echo -e "${RED}[-] Layer 1 FAIL: expected open() to be denied by device permissions.${NC}"
+        return 1
     fi
+    echo -e "${GREEN}[+] Layer 1 PASS: open() denied by /dev/sc_throttler permissions.${NC}"
 
-    echo -e "${RED}[-] Non-root configuration was not demonstrably denied.${NC}"
-    return 1
+    echo "[*] Layer 2: temporarily allow open(), then attempt a configuration IOCTL as non-root."
+    echo "[*] Temporarily chmod 0666 /dev/sc_throttler; original permissions will be restored."
+    echo "[*] Executing user_cli as $REAL_USER (EUID $REAL_UID) with inputs:"
+    echo "    4 -> Enable / Disable Monitor"
+    echo "    1 -> Attempt to enable monitoring"
+    echo "    0 -> Exit CLI"
+    echo "[*] Expect open() to succeed, then ioctl() to fail with EPERM."
+    original_mode="$(stat -c '%a' /dev/sc_throttler)" || return 1
+    DEVICE_MODE_TO_RESTORE="$original_mode"
+    if ! chmod 0666 /dev/sc_throttler; then
+        echo -e "${RED}[-] Unable to temporarily adjust device permissions.${NC}"
+        return 1
+    fi
+    output="$(su -s /bin/bash "$REAL_USER" -c "printf '4\\n1\\n0\\n' | ./user_cli" 2>&1)"
+    status=$?
+    if ! chmod "$original_mode" /dev/sc_throttler; then
+        echo -e "${RED}[-] Could not restore the original device permissions.${NC}"
+        return 1
+    fi
+    DEVICE_MODE_TO_RESTORE=""
+    # Show the genuine error and the first CLI menu; suppress the repeated menu.
+    # Keep the full, unfiltered output in $output for the actual PASS/FAIL checks.
+    printf '%s\n' "$output" | awk '
+        /^=========================================$/ {
+            separators++
+            if (separators == 3) exit
+        }
+        { print }
+    '
+    if [[ "$status" -ne 0 ]] ||
+       grep -qF '[FATAL] Failed to open device' <<<"$output" ||
+       ! grep -qF 'Failed to set status: Operation not permitted' <<<"$output"; then
+        echo -e "${RED}[-] Layer 2 FAIL: expected open() success and ioctl() -> EPERM.${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}[+] Layer 2 PASS: open() succeeded, IOCTL rejected with EPERM.${NC}"
 }
 
 run_test_2() {
     echo -e "\n${GREEN}[TEST 2] PROGRAM NAME FILTERING${NC}"
     configure_name_test || return 1
 
+    echo "[*] Comparison: identical syscall 39, different current->comm; expect only evil_app to be throttled."
     echo "[*] Launching 'good_app' (NOT registered)..."
     run_and_expect 'CONCLUSION: Allowed to pass.' timeout 5s ./test_identity good_app || return 1
 
@@ -185,6 +252,7 @@ run_test_2() {
 run_test_3() {
     echo -e "\n${GREEN}[TEST 3] EFFECTIVE USER-ID (EUID) FILTERING${NC}"
     echo "Objective: apply the rule only to the registered effective user-ID."
+    echo "[*] Comparison: syscall 83 is identical; EUID $REAL_UID is registered, EUID 0 is not."
     configure_uid_test || return 1
 
     echo -e "\n[*] Rule: throttle EUID $REAL_UID on syscall 83."
@@ -200,6 +268,7 @@ run_test_3() {
 run_test_4() {
     echo -e "\n${GREEN}[TEST 4] WALL-CLOCK RESET (1 SECOND)${NC}"
     echo "Objective: verify the delay applied to the (MAX+1)-th request."
+    echo "[*] Test program: 5 immediate mkdir calls, then measure elapsed time for call 6."
     configure_uid_test || return 1
     run_and_expect 'CONCLUSION: 1 sec wall-clock verified!' \
         su -s /bin/bash "$REAL_USER" -c "./test_wallclock 5"
@@ -207,9 +276,12 @@ run_test_4() {
 
 run_test_5() {
     local output blocked
-    echo -e "\n${GREEN}[TEST 5] EXTREME CONCURRENCY (50 THREADS)${NC}"
+    echo -e "\n${GREEN}[TEST 5] CONCURRENCY (50 THREADS)${NC}"
+    echo "[*] A pthread barrier releases 50 threads against the same global MAX = 5."
     configure_concurrency_test || return 1
 
+    echo "[*] Command executed: ./test_barrier 50 (as root)"
+    echo "[*] Script PASS criterion: parsed number of blocked threads is > 0 (not a proof of exactly 45)."
     output="$(./test_barrier 50 2>&1)"
     printf '%s\n' "$output"
     blocked="$(awk -F: '/Threads blocked \(Sleep\)/ {gsub(/[[:space:]]/, "", $2); print $2}' <<<"$output")"
@@ -220,23 +292,30 @@ run_test_6() {
     local output
     echo -e "\n${GREEN}[TEST 6] STATISTICS & KERNEL LOGS${NC}"
     echo "--- IOCTL STATISTICS ---"
+    echo "[*] CLI inputs as root: 5 -> Get Real-Time Statistics; 0 -> Exit CLI"
+    echo "[*] Reading statistics from the immediately preceding concurrency test."
     output="$(printf '5\n0\n' | ./user_cli 2>&1)"
     printf '%s\n' "$output" | grep -A 7 'REAL-TIME STATISTICS' || return 1
     echo -e "\n--- LAST 8 MODULE LOGS ---"
+    echo "[*] Command: dmesg | grep SC_THROTTLER | tail -n 8"
     dmesg | grep 'SC_THROTTLER' | tail -n 8
 }
 
 run_test_7() {
     local pid_test status
     echo -e "\n${GREEN}[TEST 7] HOT REMOVAL (ANTI USE-AFTER-FREE)${NC}"
+    echo "[*] Reset module, then configure MAX=1, syscall 39 and program name test_identity."
+    echo "[*] CLI inputs: 3 -> 1; 1 -> 1 -> 39; 1 -> 3 -> test_identity; 4 -> 1"
     reset_env || return 1
     cli_cmd '3\n1' || return 1
     cli_cmd '1\n1\n39' || return 1
     cli_cmd '1\n3\ntest_identity' || return 1
     cli_cmd '4\n1' || return 1
 
+    echo "[*] Command: timeout 5s ./test_identity test_identity >/dev/null &"
     timeout 5s ./test_identity test_identity >/dev/null &
     pid_test=$!
+    echo "[*] Test process PID: $pid_test; sleep 0.5; then rmmod sc_throttler."
     sleep 0.5
 
     if ! rmmod "$MODULE_NAME"; then
@@ -247,6 +326,7 @@ run_test_7() {
     fi
     echo -e "${GREEN}[+] Module removed safely.${NC}"
 
+    echo "[*] Command: wait $pid_test; expect exit status 0."
     wait "$pid_test"
     status=$?
     if [[ "$status" -ne 0 ]]; then
@@ -255,12 +335,14 @@ run_test_7() {
     fi
     echo -e "${GREEN}[+] Test process resumed and terminated normally.${NC}"
 
+    echo "[*] Reload module after hot removal: insmod $MODULE_FILE"
     insmod "$MODULE_FILE"
 }
 
 final_health_check() {
     local kernel_slice
     echo -e "\n${YELLOW}--- FINAL HEALTH CHECK ---${NC}"
+    echo "[*] Checking kernel messages since the demo marker for errors."
     if ! kernel_slice="$(dmesg | sed -n "/$MARKER/,\$p")"; then
         echo -e "${RED}[-] Unable to read the kernel log.${NC}"
         return 1
@@ -277,8 +359,8 @@ final_health_check() {
     fi
 
     echo -e "${GREEN}[+] No kernel errors detected during the demo.${NC}"
-    echo -e "\n--- MODULE LOGS ---"
-    grep 'SC_THROTTLER' <<<"$kernel_slice" || true
+    echo -e "\n--- LAST 8 MODULE LOGS ---"
+    grep 'SC_THROTTLER' <<<"$kernel_slice" | tail -n 8 || true
 }
 
 run_demo_step() {
