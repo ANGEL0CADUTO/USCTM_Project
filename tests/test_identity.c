@@ -11,7 +11,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Change the current->comm value observed by the kernel
+    // Change the current->comm value observed by the kernelg
     prctl(PR_SET_NAME, argv[1], 0, 0, 0);
     printf("[*] Process name set to: '%s' (PID: %d)\n", argv[1], getpid());
 
