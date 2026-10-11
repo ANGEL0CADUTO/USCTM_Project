@@ -1,10 +1,11 @@
 obj-m += sc_throttler.o
 sc_throttler-objs += sc_throttler_module.o
 
+KDIR ?= /lib/modules/$(shell uname -r)/build
 TESTS_DIR := tests
 
 all:
-	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+	make -C $(KDIR) M=$(CURDIR) modules
 	gcc user.c -o user_cli
 	gcc $(TESTS_DIR)/test_barrier.c -o test_barrier -pthread
 	gcc $(TESTS_DIR)/test_identity.c -o test_identity
@@ -15,5 +16,5 @@ all:
 	gcc $(TESTS_DIR)/test_stress.c -o test_stress
 
 clean:
-	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
+	make -C $(KDIR) M=$(CURDIR) clean
 	rm -f user_cli test_barrier test_identity test_uid test_wallclock test_getpid test_mkdir test_stress

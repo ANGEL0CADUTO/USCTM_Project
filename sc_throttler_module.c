@@ -686,7 +686,11 @@ static int __init sc_throttler_init(void) {
     major_number = register_chrdev(0, DEVICE_NAME, &fops);
     if (major_number < 0) return major_number;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    sc_driver_class = class_create(DEVICE_NAME);
+#else
     sc_driver_class = class_create(THIS_MODULE, DEVICE_NAME);
+#endif
     if (IS_ERR(sc_driver_class)) {
         unregister_chrdev(major_number, DEVICE_NAME);
         return PTR_ERR(sc_driver_class);

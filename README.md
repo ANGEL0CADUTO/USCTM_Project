@@ -116,6 +116,12 @@ To avoid teardown races and use-after-free conditions, the final implementation 
 
 ---
 
+## Build verification
+
+The original project was developed and tested on Linux 5.15.0-173-generic, as recorded in the module source. The module, CLI and seven user-space test programs also compile against Ubuntu's Linux 7.0.0-38-generic x86-64 headers with GCC 15.2. The device-class setup accommodates the API change introduced in Linux 6.4.
+
+This newer-kernel check covers compilation only. Runtime interception, concurrency and unloading still require validation in a disposable VM with the target kernel. The recovery check did not load the module on the host.
+
 ## Requirements
 
 * Linux x86-64
@@ -137,6 +143,11 @@ sudo apt install build-essential linux-headers-$(uname -r)
 Compile the kernel module, the CLI, and all user-space tests:
 ```bash
 make
+```
+
+To build against a different installed header tree:
+```bash
+make KDIR=/path/to/kernel/build
 ```
 
 Clean build artifacts:
